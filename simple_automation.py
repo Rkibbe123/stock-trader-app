@@ -224,7 +224,8 @@ def call_openai_api(prompt: str, api_key: str, model: str = "gpt-4") -> str:
                 {"role": "system", "content": "You are a professional portfolio analyst. Always respond with valid JSON in the exact format requested."},
                 {"role": "user", "content": prompt}
             ],
-            max_completion_tokens=1500
+            temperature=0.3,
+            max_tokens=1500
         )
         return response.choices[0].message.content
     except Exception as e:
