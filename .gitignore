@@ -1,4 +1,28 @@
+# IDE and editor
 CLAUDE.md
-venv
 .idea
-__pycache__
+.vscode/
+
+# Python
+venv/
+.venv/
+coolenv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Sensitive files - API keys and secrets
+.env
+.env.*
+*.env
+
+# Schwab authentication and account data
+.schwab_tokens.json
+.schwab_account.json
+
+# Personal trading logs
+live_trade_log.jsonl
+
+# OS files
+.DS_Store
+Thumbs.db

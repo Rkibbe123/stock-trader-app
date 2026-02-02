@@ -650,9 +650,15 @@ Would you like to log a manual trade? Enter 'b' for buy, 's' for sell, or press 
     df_out = pd.DataFrame(results)
     if PORTFOLIO_CSV.exists():
         logger.info("Reading CSV file: %s", PORTFOLIO_CSV)
-        existing = pd.read_csv(PORTFOLIO_CSV)
-        logger.info("Successfully read CSV file: %s", PORTFOLIO_CSV)
-        existing = existing[existing["Date"] != str(today_iso)]
+        try:
+            existing = pd.read_csv(PORTFOLIO_CSV)
+            logger.info("Successfully read CSV file: %s", PORTFOLIO_CSV)
+        except pd.errors.EmptyDataError:
+            existing = pd.DataFrame()
+
+        if not existing.empty and "Date" in existing.columns:
+            existing = existing[existing["Date"] != str(today_iso)]
+            
         print("Saving results to CSV...")
         df_out = pd.concat([existing, df_out], ignore_index=True)
     logger.info("Writing CSV file: %s", PORTFOLIO_CSV)
@@ -735,7 +741,7 @@ def log_manual_buy(
         print(f"Manual buy for {ticker} failed: no market data available (source={fetch.source}).")
         return cash, chatgpt_portfolio
 
-    o = float(data.get("Open", [np.nan])[-1])
+    o = float(data["Open"].iloc[-1]) if "Open" in data.columns else np.nan
     h = float(data["High"].iloc[-1])
     l = float(data["Low"].iloc[-1])
     if np.isnan(o):
@@ -944,11 +950,18 @@ def daily_results(chatgpt_portfolio: pd.DataFrame, cash: float) -> None:
 
     # Read portfolio history
     logger.info("Reading CSV file: %s", PORTFOLIO_CSV)
-    chatgpt_df = pd.read_csv(PORTFOLIO_CSV)
-    logger.info("Successfully read CSV file: %s", PORTFOLIO_CSV)
+    try:
+        chatgpt_df = pd.read_csv(PORTFOLIO_CSV)
+        logger.info("Successfully read CSV file: %s", PORTFOLIO_CSV)
+    except pd.errors.EmptyDataError:
+        chatgpt_df = pd.DataFrame()
 
     # Use only TOTAL rows, sorted by date
-    totals = chatgpt_df[chatgpt_df["Ticker"] == "TOTAL"].copy()
+    if not chatgpt_df.empty and "Ticker" in chatgpt_df.columns:
+        totals = chatgpt_df[chatgpt_df["Ticker"] == "TOTAL"].copy()
+    else:
+        totals = pd.DataFrame()
+
     if totals.empty:
         print("\n" + "=" * 64)
         print(f"Daily Results — {today}")
@@ -1156,18 +1169,19 @@ def daily_results(chatgpt_portfolio: pd.DataFrame, cash: float) -> None:
 def load_latest_portfolio_state() -> tuple[pd.DataFrame | list[dict[str, Any]], float]:
     """Load the most recent portfolio snapshot and cash balance from global PORTFOLIO_CSV."""
     logger.info("Reading CSV file: %s", PORTFOLIO_CSV)
-    df = pd.read_csv(PORTFOLIO_CSV)
-    logger.info("Successfully read CSV file: %s", PORTFOLIO_CSV)
+    try:
+        df = pd.read_csv(PORTFOLIO_CSV)
+        logger.info("Successfully read CSV file: %s", PORTFOLIO_CSV)
+    except pd.errors.EmptyDataError:
+        logger.info("CSV file is empty: %s", PORTFOLIO_CSV)
+        df = pd.DataFrame()
+
     if df.empty:
         portfolio = pd.DataFrame(columns=["ticker", "shares", "stop_loss", "buy_price", "cost_basis"])
-        print("Portfolio CSV is empty. Returning set amount of cash for creating portfolio.")
-        try:
-            cash = float(input("What would you like your starting cash amount to be? "))
-        except ValueError:
-            raise ValueError(
-                "Cash could not be converted to float datatype. Please enter a valid number."
-            )
-        return portfolio, cash
+        # Default to $100 starting cash for empty portfolio (don't prompt)
+        default_cash = 100.0
+        logger.info("Portfolio CSV is empty. Using default starting cash: $%.2f", default_cash)
+        return portfolio, default_cash
 
     non_total = df[df["Ticker"] != "TOTAL"].copy()
     non_total["Date"] = pd.to_datetime(non_total["Date"], format="mixed", errors="coerce")
