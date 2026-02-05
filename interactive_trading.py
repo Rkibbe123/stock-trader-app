@@ -185,6 +185,58 @@ def parse_natural_trade(text: str, positions: List[Dict], cash: float) -> Dict |
     return result if result["action"] and result["ticker"] else None
 
 
+def parse_simple_trade_command(command: str, parts: List[str]) -> Dict | None:
+    """Parse simple positional commands like 'buy TICKER SHARES [STOP]'."""
+    if len(parts) < 3:
+        return None
+
+    action = command.lower()
+    stop_loss = 0.0
+
+    def is_number(token: str) -> bool:
+        return token.replace(".", "", 1).isdigit()
+
+    def is_ticker(token: str) -> bool:
+        if not token.isalpha():
+            return False
+        if token in {"share", "shares", "stock", "stocks"}:
+            return False
+        return 1 < len(token) <= 5
+
+    ticker = None
+    shares = None
+
+    # buy|sell TICKER SHARES [STOP]
+    if is_ticker(parts[1]) and is_number(parts[2]):
+        ticker = parts[1].upper()
+        shares = int(float(parts[2]))
+        if action == "buy" and len(parts) >= 4 and is_number(parts[3]):
+            stop_loss = float(parts[3])
+
+    # buy|sell SHARES TICKER [STOP]
+    elif is_number(parts[1]) and is_ticker(parts[2]):
+        shares = int(float(parts[1]))
+        ticker = parts[2].upper()
+        if action == "buy" and len(parts) >= 4 and is_number(parts[3]):
+            stop_loss = float(parts[3])
+
+    # buy|sell SHARES shares TICKER [STOP]
+    elif len(parts) >= 4 and is_number(parts[1]) and parts[2] in {"share", "shares"} and is_ticker(parts[3]):
+        shares = int(float(parts[1]))
+        ticker = parts[3].upper()
+        if action == "buy" and len(parts) >= 5 and is_number(parts[4]):
+            stop_loss = float(parts[4])
+
+    if not ticker or not shares or shares <= 0:
+        return None
+
+    trade = {"action": action, "ticker": ticker, "shares": shares}
+    if action == "buy" and stop_loss > 0:
+        trade["stop_loss"] = stop_loss
+
+    return trade
+
+
 def parse_llm_response(response: str) -> Dict[str, Any]:
     """Parse LLM response and extract trading decisions"""
     try:
@@ -770,6 +822,56 @@ def run_interactive(model: str = "rk-stockpicker", csv_path: str = None):
     
     # Interactive loop
     show_help()
+
+    def handle_natural_trade_command(command_text: str) -> None:
+        nonlocal positions, balance, orders
+        cash_available = balance.get('cash_available', 0)
+        parsed = parse_natural_trade(command_text, positions, cash_available)
+        
+        if parsed and parsed.get("ticker"):
+            ticker = parsed["ticker"]
+            action = parsed["action"]
+            shares = parsed.get("shares")
+            stop_loss = parsed.get("stop_loss", 0)
+            dollar_amount = parsed.get("dollar_amount")
+            stop_loss_pct = parsed.get("stop_loss_pct")
+            
+            # If we have a dollar amount but no shares, fetch price
+            if dollar_amount and not shares:
+                print(f"📈 Fetching current price for {ticker}...")
+                current_price = get_current_price(ticker)
+                if current_price and current_price > 0:
+                    shares = int(dollar_amount / current_price)
+                    print(f"   ${dollar_amount:.2f} ÷ ${current_price:.2f} = {shares} shares")
+                else:
+                    print(f"⚠️ Could not fetch price for {ticker}")
+            
+            # Calculate stop loss from percentage if needed
+            if stop_loss_pct and not stop_loss:
+                # Get current/buy price for calculation
+                for pos in positions:
+                    if pos.get("ticker", "").upper() == ticker:
+                        buy_price = pos.get("avg_price", 0)
+                        if buy_price > 0:
+                            stop_loss = buy_price * stop_loss_pct
+                            print(f"   Stop loss: {stop_loss_pct*100:.0f}% of ${buy_price:.2f} = ${stop_loss:.2f}")
+                        break
+            
+            if shares and shares > 0:
+                print(f"\n📝 Parsed trade: {action.upper()} {shares} {ticker}" + 
+                      (f" (stop: ${stop_loss:.2f})" if stop_loss else ""))
+                
+                trade = {"action": action, "ticker": ticker, "shares": shares, "stop_loss": stop_loss}
+                execute_trade(client, trade, portfolio_csv)
+                positions, balance, orders = display_portfolio(client, portfolio_csv)
+            else:
+                print(f"⚠️ Could not determine number of shares. Please specify.")
+                print(f"   Examples: 'buy 10 shares of {ticker}' or 'buy $50 of {ticker}'")
+        else:
+            # Couldn't parse - send to AI for help
+            print("\n🤖 Thinking...")
+            response = chat_with_llm(command_text, positions, balance, orders, model)
+            print(f"\n{response}\n")
     
     while True:
         try:
@@ -824,85 +926,20 @@ def run_interactive(model: str = "rk-stockpicker", csv_path: str = None):
                     # Refresh positions
                     positions, balance, orders = display_portfolio(client, portfolio_csv)
                 
-            elif (
-                command == 'buy'
-                and len(parts) >= 3
-                and parts[1].isalpha()
-                and parts[2].replace('.', '', 1).isdigit()
-            ):
-                ticker = parts[1].upper()
-                shares = int(float(parts[2]))
-                stop_loss = float(parts[3]) if len(parts) > 3 else 0
-                
-                trade = {"action": "buy", "ticker": ticker, "shares": shares, "stop_loss": stop_loss}
-                execute_trade(client, trade, portfolio_csv)
-                positions, balance, orders = display_portfolio(client, portfolio_csv)
-                
-            elif (
-                command == 'sell'
-                and len(parts) >= 3
-                and parts[1].isalpha()
-                and parts[2].replace('.', '', 1).isdigit()
-            ):
-                ticker = parts[1].upper()
-                shares = int(float(parts[2]))
-                
-                trade = {"action": "sell", "ticker": ticker, "shares": shares}
-                execute_trade(client, trade, portfolio_csv)
-                positions, balance, orders = display_portfolio(client, portfolio_csv)
+            elif command in ['buy', 'sell']:
+                manual_trade = parse_simple_trade_command(command, parts)
+                if manual_trade:
+                    execute_trade(client, manual_trade, portfolio_csv)
+                    positions, balance, orders = display_portfolio(client, portfolio_csv)
+                else:
+                    handle_natural_trade_command(cmd)
                 
             elif command == 'sync':
                 sync_csv_with_schwab(client, portfolio_csv)
             
             # Try to parse natural language trade commands
             elif any(word in cmd for word in ['buy', 'sell']):
-                cash_available = balance.get('cash_available', 0)
-                parsed = parse_natural_trade(cmd, positions, cash_available)
-                
-                if parsed and parsed.get("ticker"):
-                    ticker = parsed["ticker"]
-                    action = parsed["action"]
-                    shares = parsed.get("shares")
-                    stop_loss = parsed.get("stop_loss", 0)
-                    dollar_amount = parsed.get("dollar_amount")
-                    stop_loss_pct = parsed.get("stop_loss_pct")
-                    
-                    # If we have a dollar amount but no shares, fetch price
-                    if dollar_amount and not shares:
-                        print(f"📈 Fetching current price for {ticker}...")
-                        current_price = get_current_price(ticker)
-                        if current_price and current_price > 0:
-                            shares = int(dollar_amount / current_price)
-                            print(f"   ${dollar_amount:.2f} ÷ ${current_price:.2f} = {shares} shares")
-                        else:
-                            print(f"⚠️ Could not fetch price for {ticker}")
-                    
-                    # Calculate stop loss from percentage if needed
-                    if stop_loss_pct and not stop_loss:
-                        # Get current/buy price for calculation
-                        for pos in positions:
-                            if pos.get("ticker", "").upper() == ticker:
-                                buy_price = pos.get("avg_price", 0)
-                                if buy_price > 0:
-                                    stop_loss = buy_price * stop_loss_pct
-                                    print(f"   Stop loss: {stop_loss_pct*100:.0f}% of ${buy_price:.2f} = ${stop_loss:.2f}")
-                                break
-                    
-                    if shares and shares > 0:
-                        print(f"\n📝 Parsed trade: {action.upper()} {shares} {ticker}" + 
-                              (f" (stop: ${stop_loss:.2f})" if stop_loss else ""))
-                        
-                        trade = {"action": action, "ticker": ticker, "shares": shares, "stop_loss": stop_loss}
-                        execute_trade(client, trade, portfolio_csv)
-                        positions, balance, orders = display_portfolio(client, portfolio_csv)
-                    else:
-                        print(f"⚠️ Could not determine number of shares. Please specify.")
-                        print(f"   Examples: 'buy 10 shares of {ticker}' or 'buy $50 of {ticker}'")
-                else:
-                    # Couldn't parse - send to AI for help
-                    print("\n🤖 Thinking...")
-                    response = chat_with_llm(cmd, positions, balance, orders, model)
-                    print(f"\n{response}\n")
+                handle_natural_trade_command(cmd)
                 
             else:
                 # Natural language chat - send any non-command input to LLM
