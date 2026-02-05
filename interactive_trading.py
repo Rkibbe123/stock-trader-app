@@ -19,6 +19,139 @@ import pandas as pd
 from schwab_client import SchwabClient
 from schwab_auth import SchwabAuth, interactive_authorization
 
+# Import price fetching from trading_script
+try:
+    from trading_script import download_price_data, trading_day_window
+    PRICE_AVAILABLE = True
+except ImportError:
+    PRICE_AVAILABLE = False
+
+
+def get_current_price(ticker: str) -> float | None:
+    """Get current price for a ticker"""
+    if not PRICE_AVAILABLE:
+        return None
+    try:
+        s, e = trading_day_window()
+        fetch = download_price_data(ticker, start=s, end=e, progress=False)
+        if fetch.df is not None and not fetch.df.empty:
+            return float(fetch.df["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
+
+
+def parse_natural_trade(text: str, positions: List[Dict], cash: float) -> Dict | None:
+    """Parse natural language trade commands like:
+    - 'buy $25 of CTRX with stop loss of 70'
+    - 'sell 25% of my CTRX'
+    - 'sell all my CTRX'
+    - 'buy 10 shares of AAPL at $150'
+    """
+    import re
+    text = text.lower().strip()
+    
+    result = {"action": None, "ticker": None, "shares": None, "stop_loss": 0, "limit_price": 0}
+    
+    # Detect action
+    if text.startswith("buy") or " buy " in text:
+        result["action"] = "buy"
+    elif text.startswith("sell") or " sell " in text:
+        result["action"] = "sell"
+    else:
+        return None
+    
+    # Extract ticker and shares robustly
+    # Accept: 'sell 25 shares of abvt', 'sell abvt 25 shares', 'sell abvt', 'sell 25 abvt', etc.
+    trade_match = re.search(r'(?:sell|buy)?\s*(\d+)?\s*(?:share|shares)?\s*(?:of)?\s*([a-zA-Z]{2,5})\b', text)
+    if trade_match:
+        shares = trade_match.group(1)
+        ticker = trade_match.group(2)
+        if ticker and ticker.lower() != 'shares':
+            result["ticker"] = ticker.upper()
+        if shares:
+            result["shares"] = int(shares)
+    # If not found, try 'sell abvt' (no shares specified)
+    if not result["ticker"]:
+        ticker_match = re.search(r'(?:of\s+)?([a-zA-Z]{2,5})\b', text)
+        if ticker_match and ticker_match.group(1).lower() != 'shares':
+            result["ticker"] = ticker_match.group(1).upper()
+    # If not found, return None
+    if not result["ticker"]:
+        return None
+    
+    # Get current position for this ticker (for percentage sells)
+    current_shares = 0
+    current_price = 0
+    for pos in positions:
+        if pos.get("ticker", "").upper() == result["ticker"]:
+            current_shares = pos.get("shares", 0)
+            current_price = pos.get("current_price", 0) or pos.get("market_value", 0) / max(current_shares, 1)
+            break
+    
+    # Parse sell percentage: "sell 25% of CTRX", "sell half", "sell all", "sell 25 share of abvc"
+    if result["action"] == "sell":
+        if "all" in text or "100%" in text:
+            result["shares"] = int(current_shares)
+        elif "half" in text or "50%" in text:
+            result["shares"] = int(current_shares * 0.5)
+        else:
+            # Accept both 'share' and 'shares', and ignore extra words like 'of'
+            pct_match = re.search(r'(\d+(?:\.\d+)?)\s*%\s*(?:of)?', text)
+            if pct_match:
+                pct = float(pct_match.group(1)) / 100
+                result["shares"] = int(current_shares * pct)
+            else:
+                # Look for share count, ignore 'share'/'shares' and 'of'
+                # Match 'sell 25 shares of abvt' or 'sell 25 abvt'
+                shares_match = re.search(r'(?:sell|buy)?\s*(\d+)\s*(?:share|shares)?\s*(?:of)?\s*([a-zA-Z]{2,5})\b', text)
+                if shares_match:
+                    result["shares"] = int(shares_match.group(1))
+    
+    # Parse buy by dollar amount: "buy $25 of CTRX"
+    if result["action"] == "buy":
+        dollar_match = re.search(r'\$\s*(\d+(?:\.\d+)?)', text)
+        if dollar_match:
+            dollar_amount = float(dollar_match.group(1))
+            # Need to get current price to calculate shares
+            if current_price > 0:
+                result["shares"] = int(dollar_amount / current_price)
+            else:
+                # Try to fetch price - for now estimate
+                result["dollar_amount"] = dollar_amount
+                result["shares"] = None  # Will be calculated when we have price
+        else:
+            # Look for share count
+            shares_match = re.search(r'(\d+)\s*shares?', text)
+            if shares_match:
+                result["shares"] = int(shares_match.group(1))
+    
+    # Parse stop loss: "with stop loss of 70", "stop at 0.70", "stop 70%"
+    stop_patterns = [
+        r'stop\s*(?:loss\s*)?(?:of\s*|at\s*)?\$?(\d+(?:\.\d+)?)\s*%',  # "stop loss of 70%" (percentage)
+        r'stop\s*(?:loss\s*)?(?:of\s*|at\s*)?\$?(\d+(?:\.\d+)?)',  # "stop loss of 0.70" (price)
+    ]
+    
+    for pattern in stop_patterns:
+        match = re.search(pattern, text)
+        if match:
+            stop_val = float(match.group(1))
+            # Determine if it's a percentage or absolute price
+            if "%" in text[match.start():match.end()+5] or stop_val > 50:
+                # It's a percentage (e.g., stop at 70% means stop at 70% of buy price)
+                # For now, store as percentage to be calculated later
+                result["stop_loss_pct"] = stop_val / 100 if stop_val > 1 else stop_val
+            else:
+                result["stop_loss"] = stop_val
+            break
+    
+    # Parse limit price: "at $150", "@ 5.50"
+    price_match = re.search(r'(?:at|@)\s*\$?(\d+(?:\.\d+)?)', text)
+    if price_match:
+        result["limit_price"] = float(price_match.group(1))
+    
+    return result if result["action"] and result["ticker"] else None
+
 
 def parse_llm_response(response: str) -> Dict[str, Any]:
     """Parse LLM response and extract trading decisions"""
@@ -489,14 +622,21 @@ def show_help():
   recommend, r   - Get LLM trading recommendations
   execute, e     - Execute a recommended trade
   orders, o      - Show open orders
-  buy <TICKER> <SHARES> [STOP]  - Manual buy order
-  sell <TICKER> <SHARES>        - Manual sell order
   sync           - Sync CSV with Schwab positions
   help, h        - Show this help menu
   quit, q        - Exit
+
+📝 NATURAL LANGUAGE TRADES (just type normally!):
+  • "buy $25 of CTRX"
+  • "buy $50 of AAPL with stop at $140"
+  • "buy 10 shares of MSFT"
+  • "sell 25% of my CTRX"
+  • "sell half of AAPL"
+  • "sell all my CTRX"
+  • "sell 50 shares of TSLA"
 """)
     print("="*70)
-    print("💡 TIP: You can also ask questions in natural language!")
+    print("💡 You can also ask questions in natural language!")
     print("   Examples:")
     print("   • \"What's my best performing stock?\"")
     print("   • \"Should I sell CTXR?\"")
@@ -671,6 +811,56 @@ def run_interactive(model: str = "rk-stockpicker", csv_path: str = None):
                 
             elif command == 'sync':
                 sync_csv_with_schwab(client, portfolio_csv)
+            
+            # Try to parse natural language trade commands
+            elif any(word in cmd for word in ['buy', 'sell']):
+                cash_available = balance.get('cash_available', 0)
+                parsed = parse_natural_trade(cmd, positions, cash_available)
+                
+                if parsed and parsed.get("ticker"):
+                    ticker = parsed["ticker"]
+                    action = parsed["action"]
+                    shares = parsed.get("shares")
+                    stop_loss = parsed.get("stop_loss", 0)
+                    dollar_amount = parsed.get("dollar_amount")
+                    stop_loss_pct = parsed.get("stop_loss_pct")
+                    
+                    # If we have a dollar amount but no shares, fetch price
+                    if dollar_amount and not shares:
+                        print(f"📈 Fetching current price for {ticker}...")
+                        current_price = get_current_price(ticker)
+                        if current_price and current_price > 0:
+                            shares = int(dollar_amount / current_price)
+                            print(f"   ${dollar_amount:.2f} ÷ ${current_price:.2f} = {shares} shares")
+                        else:
+                            print(f"⚠️ Could not fetch price for {ticker}")
+                    
+                    # Calculate stop loss from percentage if needed
+                    if stop_loss_pct and not stop_loss:
+                        # Get current/buy price for calculation
+                        for pos in positions:
+                            if pos.get("ticker", "").upper() == ticker:
+                                buy_price = pos.get("avg_price", 0)
+                                if buy_price > 0:
+                                    stop_loss = buy_price * stop_loss_pct
+                                    print(f"   Stop loss: {stop_loss_pct*100:.0f}% of ${buy_price:.2f} = ${stop_loss:.2f}")
+                                break
+                    
+                    if shares and shares > 0:
+                        print(f"\n📝 Parsed trade: {action.upper()} {shares} {ticker}" + 
+                              (f" (stop: ${stop_loss:.2f})" if stop_loss else ""))
+                        
+                        trade = {"action": action, "ticker": ticker, "shares": shares, "stop_loss": stop_loss}
+                        execute_trade(client, trade, portfolio_csv)
+                        positions, balance, orders = display_portfolio(client, portfolio_csv)
+                    else:
+                        print(f"⚠️ Could not determine number of shares. Please specify.")
+                        print(f"   Examples: 'buy 10 shares of {ticker}' or 'buy $50 of {ticker}'")
+                else:
+                    # Couldn't parse - send to AI for help
+                    print("\n🤖 Thinking...")
+                    response = chat_with_llm(cmd, positions, balance, orders, model)
+                    print(f"\n{response}\n")
                 
             else:
                 # Natural language chat - send any non-command input to LLM

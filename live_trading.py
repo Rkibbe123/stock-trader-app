@@ -126,16 +126,25 @@ def generate_trading_prompt(positions: List[dict], cash: float, total_value: flo
     """Generate a trading prompt with current Schwab portfolio data"""
     
     if not positions:
-        holdings_text = "No current holdings"
+        holdings_text = "No current holdings - account is 100% cash"
+        position_review = "✅ No existing positions to evaluate."
     else:
         holdings_lines = []
+        position_review_lines = ["⚠️ EXISTING POSITIONS - EVALUATE BEFORE NEW BUYS:"]
         for pos in positions:
             symbol = pos.get("instrument", {}).get("symbol", "N/A")
             qty = pos.get("longQuantity", 0) or pos.get("shortQuantity", 0)
             avg_price = pos.get("averagePrice", 0)
             market_value = pos.get("marketValue", 0)
-            holdings_lines.append(f"{symbol}: {qty} shares @ ${avg_price:.2f} (value: ${market_value:.2f})")
+            current_price = market_value / qty if qty > 0 else 0
+            cost_basis = qty * avg_price
+            pnl = market_value - cost_basis
+            pnl_pct = (pnl / cost_basis * 100) if cost_basis > 0 else 0
+            pnl_sign = "+" if pnl >= 0 else ""
+            holdings_lines.append(f"{symbol}: {int(qty)} shares @ ${avg_price:.2f} (current: ${current_price:.2f}, value: ${market_value:.2f}, P&L: {pnl_sign}${pnl:.2f} / {pnl_sign}{pnl_pct:.1f}%)")
+            position_review_lines.append(f"  • {symbol}: Should SELL? (taking profits / cutting losses / rebalancing)")
         holdings_text = "\n".join(holdings_lines)
+        position_review = "\n".join(position_review_lines)
 
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -149,42 +158,51 @@ Here is the current portfolio state as of {today}:
 Cash Available: ${cash:,.2f}
 Total Account Value: ${total_value:,.2f}
 
+[ Position Review Required ]
+{position_review}
+
 IMPORTANT: This is a REAL account with REAL money. Be thoughtful but decisive.
+
+CRITICAL WORKFLOW - FOLLOW THIS ORDER:
+1. FIRST: Review ALL existing positions above
+2. SECOND: For each position, decide: SELL (profits/losses/rebalance) or HOLD?
+3. THIRD: Only after evaluating sells, consider new BUY opportunities
+4. FOURTH: Ensure cash available (including proceeds from sells) covers any buys
 
 Rules:
 - You have ${cash:,.2f} in cash available for new positions
+- Consider selling existing positions before buying new ones
 - Prefer U.S. micro-cap stocks (<$300M market cap) for aggressive growth
 - Full shares only, no options or derivatives
 - Use stop-losses for risk management (typically 15-25% below entry)
-- Consider current positions when making new recommendations
-- If you recommend selling, provide specific exit reasoning
+- If recommending selling, provide specific exit reasoning (profit target, stop-loss, thesis broken)
 
 Analyze the current market conditions and provide specific trading recommendations.
 
-Respond with ONLY a JSON object in this exact format:
+Respond with ONLY a JSON object in this exact format (list SELLS before BUYS):
 {{
-    "analysis": "Brief market analysis and portfolio assessment",
+    "analysis": "Brief market analysis and portfolio assessment including evaluation of existing positions",
     "trades": [
-        {{
-            "action": "buy",
-            "ticker": "SYMBOL",
-            "shares": 10,
-            "price": 5.50,
-            "stop_loss": 4.50,
-            "reason": "Brief rationale"
-        }},
         {{
             "action": "sell",
             "ticker": "EXISTING_SYMBOL",
-            "shares": 5,
+            "shares": 100,
             "price": 8.00,
-            "reason": "Exit rationale"
+            "reason": "Exit rationale - taking profits / stop-loss hit / thesis broken"
+        }},
+        {{
+            "action": "buy",
+            "ticker": "NEW_SYMBOL",
+            "shares": 10,
+            "price": 5.50,
+            "stop_loss": 4.50,
+            "reason": "Entry rationale"
         }}
     ],
     "confidence": 0.75
 }}
 
-Be aggressive but not reckless. Recommend trades you are confident about."""
+Be aggressive but not reckless. Always evaluate existing positions before recommending new buys."""
     return prompt
 
 

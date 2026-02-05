@@ -175,6 +175,20 @@ class AzureTradingChatbot:
         """Build the system prompt for the trading agent."""
         return """You are a professional-grade portfolio strategist managing a real-money micro-cap portfolio.
 
+CRITICAL WORKFLOW - ALWAYS FOLLOW THIS ORDER:
+1. FIRST: Review the current Schwab account positions shown in the portfolio summary
+2. SECOND: Evaluate each existing position - should any be SOLD (taking profits, cutting losses, or rebalancing)?
+3. THIRD: Only after considering sells, evaluate potential new BUY opportunities
+4. FOURTH: Ensure you have sufficient cash (including proceeds from any sells) before recommending buys
+
+POSITION MANAGEMENT RULES:
+- ALWAYS review existing positions before recommending new buys
+- Sell positions that have: hit profit targets, broken stop-losses, have deteriorating fundamentals, or better opportunities exist
+- Consider trimming winners to lock in profits
+- Cut losers quickly if thesis is broken
+- Don't recommend buys if existing positions need attention first
+- Account for cash from pending sells when sizing new positions
+
 CORE RULES:
 - Budget discipline: No new capital beyond what's shown. Track cash precisely.
 - Execution limits: Full shares only. No options, shorting, leverage, margin, or derivatives. Long-only.
@@ -202,25 +216,35 @@ If a stock has any red flags, find an alternative. There are thousands of tradea
 
 AVAILABLE TOOLS:
 1. get_stock_prices - Retrieves real-time stock prices. ALWAYS use this before recommending trades.
+   - Use this for BOTH existing positions AND potential new buys
 2. get_stock_news - Retrieves news, sentiment, financials, and analyst ratings for a stock.
    Use this to research stocks before making recommendations.
 
 RESEARCH PROCESS:
-1. When asked for recommendations, first use get_stock_news to research potential picks
-2. Consider news sentiment, analyst ratings, and financials in your analysis
-3. Then use get_stock_prices to verify current prices
-4. Verify the stock doesn't have trading restrictions (price > $1, major exchange, good volume)
-5. Only then make your recommendation with full context
+1. FIRST: Check prices of ALL existing Schwab positions using get_stock_prices
+2. Evaluate each position: Is it time to sell (profit target, stop-loss hit, thesis broken)?
+3. Research potential new picks using get_stock_news
+4. Verify current prices with get_stock_prices
+5. Verify stocks don't have trading restrictions (price > $1, major exchange, good volume)
+6. Make recommendations - SELLS FIRST, then BUYS
 
 RESPONSE FORMAT FOR TRADES:
-When recommending trades, include a JSON block like this:
+When recommending trades, include a JSON block like this. List SELL orders before BUY orders:
 
 ```json
 {
     "trades": [
         {
+            "action": "sell",
+            "ticker": "EXISTING_POSITION",
+            "shares": 100,
+            "order_type": "limit",
+            "limit_price": 8.50,
+            "reason": "Taking profits after 25% gain / Stop-loss triggered / Thesis broken"
+        },
+        {
             "action": "buy",
-            "ticker": "SYMBOL",
+            "ticker": "NEW_SYMBOL",
             "shares": 10,
             "order_type": "limit",
             "limit_price": 5.50,
@@ -359,20 +383,27 @@ Total Equity: ${total_equity:,.2f}
             positions = self.schwab_client.get_positions()
             
             summary = f"""
-[ SCHWAB REAL ACCOUNT ]
+[ 🏦 SCHWAB REAL ACCOUNT - REVIEW BEFORE TRADING ]
 Cash Available: ${balance.get('cash_available', 0):,.2f}
 Account Value: ${balance.get('account_value', 0):,.2f}
 Buying Power: ${balance.get('buying_power', 0):,.2f}
 """
             if positions:
-                summary += f"\nReal Positions ({len(positions)}):\n"
+                summary += f"\n⚠️ EXISTING POSITIONS TO EVALUATE ({len(positions)}):\n"
+                summary += "   (Consider: Should any be SOLD before buying new positions?)\n"
                 for pos in positions:
                     symbol = pos.get("instrument", {}).get("symbol", "N/A")
                     qty = pos.get("longQuantity", 0) or pos.get("shortQuantity", 0)
                     avg_price = pos.get("averagePrice", 0)
-                    summary += f"  {symbol}: {qty} shares @ ${avg_price:.2f}\n"
+                    market_value = pos.get("marketValue", 0)
+                    current_price = market_value / qty if qty > 0 else 0
+                    cost_basis = qty * avg_price
+                    pnl = market_value - cost_basis
+                    pnl_pct = (pnl / cost_basis * 100) if cost_basis > 0 else 0
+                    pnl_sign = "+" if pnl >= 0 else ""
+                    summary += f"  • {symbol}: {int(qty)} shares @ ${avg_price:.2f} avg → Current: ${current_price:.2f} | P&L: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_pct:.1f}%)\n"
             else:
-                summary += "\nNo positions in Schwab account.\n"
+                summary += "\n✅ No existing positions - account is 100% cash.\n"
             
             return summary
         except Exception as e:
