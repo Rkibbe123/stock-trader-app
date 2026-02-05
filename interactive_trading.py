@@ -49,10 +49,11 @@ def parse_natural_trade(text: str, positions: List[Dict], cash: float) -> Dict |
     - 'buy 10 shares of AAPL at $150'
     """
     import re
-    text = text.lower().strip()
-    
+    raw_text = text.strip()
+    text = raw_text.lower().strip()
+
     result = {"action": None, "ticker": None, "shares": None, "stop_loss": 0, "limit_price": 0}
-    
+
     # Detect action
     if text.startswith("buy") or " buy " in text:
         result["action"] = "buy"
@@ -60,26 +61,64 @@ def parse_natural_trade(text: str, positions: List[Dict], cash: float) -> Dict |
         result["action"] = "sell"
     else:
         return None
-    
-    # Extract ticker and shares robustly
-    # Accept: 'sell 25 shares of abvt', 'sell abvt 25 shares', 'sell abvt', 'sell 25 abvt', etc.
-    trade_match = re.search(r'(?:sell|buy)?\s*(\d+)?\s*(?:share|shares)?\s*(?:of)?\s*([a-zA-Z]{2,5})\b', text)
-    if trade_match:
-        shares = trade_match.group(1)
-        ticker = trade_match.group(2)
-        if ticker and ticker.lower() != 'shares':
-            result["ticker"] = ticker.upper()
-        if shares:
-            result["shares"] = int(shares)
-    # If not found, try 'sell abvt' (no shares specified)
-    if not result["ticker"]:
-        ticker_match = re.search(r'(?:of\s+)?([a-zA-Z]{2,5})\b', text)
-        if ticker_match and ticker_match.group(1).lower() != 'shares':
-            result["ticker"] = ticker_match.group(1).upper()
-    # If not found, return None
+
+    stopwords = {
+        "buy", "sell", "share", "shares", "stock", "stocks", "my", "the", "all", "half",
+        "of", "at", "to", "with", "stop", "loss", "limit", "market", "price", "percent",
+        "pct", "usd", "dollars"
+    }
+
+    def extract_ticker() -> str | None:
+        dollar_match = re.search(r'\$([a-zA-Z]{1,5})\b', raw_text)
+        if dollar_match:
+            return dollar_match.group(1).upper()
+
+        action_match = re.search(r'\b(?:buy|sell)\b', raw_text, re.IGNORECASE)
+        if action_match:
+            tail = raw_text[action_match.end():]
+            tail_tokens = re.findall(r'\b([a-zA-Z]{2,5})\b', tail)
+            for token in tail_tokens:
+                if token.lower() not in stopwords:
+                    return token.upper()
+
+        for match in re.finditer(r'\b([a-zA-Z]{2,5})\b\s*(?:stock|stocks|shares?)\b', raw_text, re.IGNORECASE):
+            candidate = match.group(1)
+            if candidate.lower() not in stopwords:
+                return candidate.upper()
+
+        for match in re.finditer(r'\bof\s+([a-zA-Z]{2,5})\b', raw_text, re.IGNORECASE):
+            candidate = match.group(1)
+            if candidate.lower() not in stopwords:
+                return candidate.upper()
+
+        tokens = re.findall(r'\b([a-zA-Z]{2,5})\b', raw_text)
+        for token in reversed(tokens):
+            if token.lower() not in stopwords:
+                return token.upper()
+
+        return None
+
+    result["ticker"] = extract_ticker()
     if not result["ticker"]:
         return None
     
+    def extract_share_count(ticker: str) -> int | None:
+        ticker_lower = re.escape(ticker.lower())
+        patterns = [
+            rf'(?:buy|sell)?\s*(\d+(?:\.\d+)?)\s*(?:shares?|sh)?\s*(?:of\s+|in\s+)?{ticker_lower}\b',
+            rf'{ticker_lower}\b\s*(\d+(?:\.\d+)?)\s*(?:shares?|sh)?\b',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return int(float(match.group(1)))
+
+        shares_match = re.search(r'(\d+)\s*shares?\b', text)
+        if shares_match:
+            return int(shares_match.group(1))
+
+        return None
+
     # Get current position for this ticker (for percentage sells)
     current_shares = 0
     current_price = 0
@@ -91,9 +130,9 @@ def parse_natural_trade(text: str, positions: List[Dict], cash: float) -> Dict |
     
     # Parse sell percentage: "sell 25% of CTRX", "sell half", "sell all", "sell 25 share of abvc"
     if result["action"] == "sell":
-        if "all" in text or "100%" in text:
+        if re.search(r'\ball\b', text) or "100%" in text:
             result["shares"] = int(current_shares)
-        elif "half" in text or "50%" in text:
+        elif re.search(r'\bhalf\b', text) or "50%" in text:
             result["shares"] = int(current_shares * 0.5)
         else:
             # Accept both 'share' and 'shares', and ignore extra words like 'of'
@@ -102,11 +141,7 @@ def parse_natural_trade(text: str, positions: List[Dict], cash: float) -> Dict |
                 pct = float(pct_match.group(1)) / 100
                 result["shares"] = int(current_shares * pct)
             else:
-                # Look for share count, ignore 'share'/'shares' and 'of'
-                # Match 'sell 25 shares of abvt' or 'sell 25 abvt'
-                shares_match = re.search(r'(?:sell|buy)?\s*(\d+)\s*(?:share|shares)?\s*(?:of)?\s*([a-zA-Z]{2,5})\b', text)
-                if shares_match:
-                    result["shares"] = int(shares_match.group(1))
+                result["shares"] = extract_share_count(result["ticker"])
     
     # Parse buy by dollar amount: "buy $25 of CTRX"
     if result["action"] == "buy":
@@ -121,10 +156,7 @@ def parse_natural_trade(text: str, positions: List[Dict], cash: float) -> Dict |
                 result["dollar_amount"] = dollar_amount
                 result["shares"] = None  # Will be calculated when we have price
         else:
-            # Look for share count
-            shares_match = re.search(r'(\d+)\s*shares?', text)
-            if shares_match:
-                result["shares"] = int(shares_match.group(1))
+            result["shares"] = extract_share_count(result["ticker"])
     
     # Parse stop loss: "with stop loss of 70", "stop at 0.70", "stop 70%"
     stop_patterns = [
