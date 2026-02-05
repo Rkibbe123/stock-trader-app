@@ -824,18 +824,28 @@ def run_interactive(model: str = "rk-stockpicker", csv_path: str = None):
                     # Refresh positions
                     positions, balance, orders = display_portfolio(client, portfolio_csv)
                 
-            elif command == 'buy' and len(parts) >= 3:
+            elif (
+                command == 'buy'
+                and len(parts) >= 3
+                and parts[1].isalpha()
+                and parts[2].replace('.', '', 1).isdigit()
+            ):
                 ticker = parts[1].upper()
-                shares = int(parts[2])
+                shares = int(float(parts[2]))
                 stop_loss = float(parts[3]) if len(parts) > 3 else 0
                 
                 trade = {"action": "buy", "ticker": ticker, "shares": shares, "stop_loss": stop_loss}
                 execute_trade(client, trade, portfolio_csv)
                 positions, balance, orders = display_portfolio(client, portfolio_csv)
                 
-            elif command == 'sell' and len(parts) >= 3:
+            elif (
+                command == 'sell'
+                and len(parts) >= 3
+                and parts[1].isalpha()
+                and parts[2].replace('.', '', 1).isdigit()
+            ):
                 ticker = parts[1].upper()
-                shares = int(parts[2])
+                shares = int(float(parts[2]))
                 
                 trade = {"action": "sell", "ticker": ticker, "shares": shares}
                 execute_trade(client, trade, portfolio_csv)
